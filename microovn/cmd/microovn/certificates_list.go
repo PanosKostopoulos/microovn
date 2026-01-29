@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/canonical/microcluster/v3/microcluster"
 	"github.com/canonical/microovn/microovn/api/types"
@@ -26,14 +30,18 @@ type cmdCertificatesList struct {
 type caCertInfo struct {
 	Cert      string `json:"cert"`
 	AutoRenew bool   `json:"auto_renew"`
+	ExpDate   string `json:"expiration_date"`
 }
 
 // certBundle is structure for holding path to certificate and related private key
+// as well as the cert's expiration date
 type certBundle struct {
-	Cert string `json:"cert"`
-	Key  string `json:"key"`
+	Cert    string `json:"cert"`
+	Key     string `json:"key"`
+	ExpDate string `json:"expiration_date"`
 }
 
+// ExpDate string `json:"expiration_date"`
 // ovnCertificatePaths is structure that holds paths to all certificates used by OVN
 type ovnCertificatePaths struct {
 	Ca      *caCertInfo `json:"ca"`
@@ -83,17 +91,12 @@ func (c *cmdCertificatesList) Run(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	var expectedCertificates ovnCertificatePaths
 	caInfo, err := client.GetCaInfo(context.Background(), cli)
 	if err != nil {
 		return err
 	}
 	if caInfo.Error != "" {
 		return fmt.Errorf("%s", caInfo.Error)
-	}
-	expectedCertificates.Ca = &caCertInfo{
-		Cert:      paths.PkiCaCertFile(),
-		AutoRenew: caInfo.AutoRenew,
 	}
 
 	// Get list of all services in microovn
@@ -102,30 +105,8 @@ func (c *cmdCertificatesList) Run(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	// Gather paths to all certificates that should be running on local host
-	for _, srv := range services {
-		// Skip service that do not run on this member
-		if srv.Location != localHostname {
-			continue
-		}
-
-		if srv.Service == types.SrvCentral {
-			nbCert, nbKey := paths.PkiOvnNbCertFiles()
-			sbCert, sbKey := paths.PkiOvnSbCertFiles()
-			northdCert, northdKey := paths.PkiOvnNorthdCertFiles()
-
-			expectedCertificates.Nb = &certBundle{nbCert, nbKey}
-			expectedCertificates.Sb = &certBundle{sbCert, sbKey}
-			expectedCertificates.Northd = &certBundle{northdCert, northdKey}
-		}
-
-		if srv.Service == types.SrvChassis {
-			ctlCert, ctlKey := paths.PkiOvnControllerCertFiles()
-			expectedCertificates.Chassis = &certBundle{ctlCert, ctlKey}
-		}
-		clientCert, clientKey := paths.PkiClientCertFiles()
-		expectedCertificates.Client = &certBundle{clientCert, clientKey}
-	}
+	var expectedCertificates ovnCertificatePaths
+	populateExpectedCertificates(&expectedCertificates, services, caInfo, localHostname)
 
 	outputFormat := cmd.Flag("format").Value.String()
 	switch outputFormat {
@@ -143,6 +124,45 @@ func (c *cmdCertificatesList) Run(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
+func populateExpectedCertificates(expectedCertificates *ovnCertificatePaths, services types.Services, caInfo types.CaInfo, localHostname string) {
+	expectedCertificates.Ca = &caCertInfo{
+		Cert:      paths.PkiCaCertFile(),
+		AutoRenew: caInfo.AutoRenew,
+		ExpDate:   "",
+	}
+	caExpDate, _ := certExpDate(expectedCertificates.Ca.Cert)
+	expectedCertificates.Ca.ExpDate = caExpDate.String()
+	// Gather paths to all certificates that should be running on local host
+	for _, srv := range services {
+		// Skip service that do not run on this member
+		if srv.Location != localHostname {
+			continue
+		}
+
+		if srv.Service == types.SrvCentral {
+			nbCert, nbKey := paths.PkiOvnNbCertFiles()
+			nbCertExpDate, _ := certExpDate(nbCert)
+			sbCert, sbKey := paths.PkiOvnSbCertFiles()
+			sbCertExpDate, _ := certExpDate(sbCert)
+			northdCert, northdKey := paths.PkiOvnNorthdCertFiles()
+			northdCertExpDate, _ := certExpDate(northdCert)
+
+			expectedCertificates.Nb = &certBundle{nbCert, nbKey, nbCertExpDate.String()}
+			expectedCertificates.Sb = &certBundle{sbCert, sbKey, sbCertExpDate.String()}
+			expectedCertificates.Northd = &certBundle{northdCert, northdKey, northdCertExpDate.String()}
+		}
+
+		if srv.Service == types.SrvChassis {
+			ctlCert, ctlKey := paths.PkiOvnControllerCertFiles()
+			ctlCertExpDate, _ := certExpDate(ctlCert)
+			expectedCertificates.Chassis = &certBundle{ctlCert, ctlKey, ctlCertExpDate.String()}
+		}
+		clientCert, clientKey := paths.PkiClientCertFiles()
+		clientCertExpDate, _ := certExpDate(clientCert)
+		expectedCertificates.Client = &certBundle{clientCert, clientKey, clientCertExpDate.String()}
+	}
+}
+
 // printOvnCertStatus prints overall status of certificate bundles contained in
 // "certificates" argument
 func printOvnCertStatus(certificates *ovnCertificatePaths) {
@@ -151,6 +171,7 @@ func printOvnCertStatus(certificates *ovnCertificatePaths) {
 		fmt.Println("Error: missing")
 	} else {
 		printFileStatus(certificates.Ca.Cert)
+		printCertExpDate(certificates.Ca.ExpDate)
 		fmt.Printf("Auto-renew: %t\n", certificates.Ca.AutoRenew)
 	}
 
@@ -176,6 +197,7 @@ func printCertBundleStatus(bundle *certBundle) {
 		fmt.Println("Not present.")
 	} else {
 		printFileStatus(bundle.Cert)
+		printCertExpDate(bundle.ExpDate)
 		printFileStatus(bundle.Key)
 	}
 }
@@ -191,4 +213,36 @@ func printFileStatus(filePath string) {
 		certStatus = "OK: Present"
 	}
 	fmt.Printf("%s (%s)\n", filePath, certStatus)
+}
+
+func printCertExpDate(expDate string) {
+	fmt.Printf("expiration date: %s\n", expDate)
+}
+
+// certExpDate returns the expiration date of public certificates
+func certExpDate(filePath string) (time.Time, error) {
+	data, _ := os.ReadFile(filePath)
+	certData, _ := pem.Decode(data)
+	if certData == nil {
+		return time.Time{}, errors.New("failed to decode certificate's PEM data")
+	}
+	cert, err := x509.ParseCertificate(certData.Bytes)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return cert.NotAfter, nil
+}
+
+// certIsExpired returns true if certificate has expired, else false
+func certIsExpired(filePath string) (bool, error) {
+	certExpDate, err := certExpDate(filePath)
+	if err == nil {
+		if time.Now().After(certExpDate) {
+			return true, nil
+		} else {
+			return false, nil
+		}
+
+	}
+	return true, err
 }
